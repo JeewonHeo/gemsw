@@ -36,11 +36,20 @@
 
 #include "CommonTools/UtilAlgos/interface/TFileService.h"
 
+#include "DataFormats/GEMDigi/interface/GEMDigiCollection.h"
+#include "DataFormats/GEMDigi/interface/GEMOHStatusCollection.h"
 #include "DataFormats/GEMRecHit/interface/GEMRecHitCollection.h"
 #include "DataFormats/MuonDetId/interface/GEMDetId.h"
 #include "DataFormats/OnlineMetaData/interface/OnlineLuminosityRecord.h"
 
+#include "Geometry/Records/interface/MuonGeometryRecord.h"
+#include "Geometry/GEMGeometry/interface/GEMGeometry.h"
+
+#include "FWCore/Framework/interface/ESHandle.h"
+#include "FWCore/Framework/interface/Run.h"
+
 #include "TFile.h"
+#include "TH1D.h"
 #include "TTree.h"
 
 // class declaration
@@ -52,7 +61,9 @@
 // This will improve performance in multithreaded jobs.
 
 
-class gemBackground : public edm::one::EDAnalyzer<edm::one::SharedResources> {
+typedef std::tuple<int, int> Key2;
+
+class gemBackground : public edm::one::EDAnalyzer<> {
 public:
   explicit gemBackground(const edm::ParameterSet&);
   ~gemBackground() override;
@@ -60,14 +71,19 @@ public:
   static void fillDescriptions(edm::ConfigurationDescriptions& descriptions);
 
 private:
-  void analyze(const edm::Event&, const edm::EventSetup&) override;
-  void beginJob() override;
-  void endJob() override;
+  bool maskChamberWithError(const GEMDetId& chamber_id, const edm::Handle<GEMOHStatusCollection>);
+  virtual void analyze(const edm::Event&, const edm::EventSetup&);// override;
+  virtual void beginJob() override;
+  virtual void endJob() override;
 
   // ----------member data ---------------------------
+  edm::EDGetTokenT<GEMDigiCollection> gemDigis_;
+  edm::EDGetTokenT<GEMOHStatusCollection> oh_status_collection_;
   edm::EDGetTokenT<GEMRecHitCollection> gemRecHits_;
   edm::EDGetTokenT<OnlineLuminosityRecord> onlineLumiRecord_;
+  edm::ESGetToken<GEMGeometry, MuonGeometryRecord> hGEMGeom_;
 
+  std::map<Key2, TH1D*> bad_chamber_;
   edm::Service<TFileService> fs_;
 
   TTree *t_rec_hits;
@@ -78,6 +94,8 @@ private:
 };
 
 gemBackground::gemBackground(const edm::ParameterSet& iConfig) {
+  gemDigis_ = consumes<GEMDigiCollection>(iConfig.getParameter<edm::InputTag>("muonGEMDigis"));
+  oh_status_collection_ = consumes<GEMOHStatusCollection>(iConfig.getParameter<edm::InputTag>("OHInputLabel"));
   gemRecHits_ = consumes<GEMRecHitCollection>(iConfig.getParameter<edm::InputTag>("gemRecHits"));
   onlineLumiRecord_ = consumes<OnlineLuminosityRecord>(iConfig.getParameter<edm::InputTag>("onlineMetaDataDigis"));
   t_rec_hits = fs_->make<TTree>("rec_hits", "gem_rec_hits");
@@ -106,20 +124,39 @@ gemBackground::~gemBackground() {
 // member functions
 //
 
+bool gemBackground::maskChamberWithError(const GEMDetId& chamber_id,
+                                         // const GEMOHStatusCollection* oh_status_collection) {
+                                         const edm::Handle<GEMOHStatusCollection> oh_status_collection) {
+  const bool mask = true;
+  for (auto iter = oh_status_collection->begin(); iter != oh_status_collection->end(); iter++) {
+    const auto [oh_id, range] = (*iter);
+    if (chamber_id != oh_id) {
+      continue;
+    }
+
+    for (auto oh_status = range.first; oh_status != range.second; oh_status++) {
+      if (oh_status->isBad()) {
+        // GEMOHStatus is bad. Mask this chamber.
+        // std::cout << "Chamber Id " << oh_id << " isBad " << oh_status->isBad() << std::endl;
+        return mask;
+      }  // isBad
+    }  // range
+  }  // collection
+  return not mask;
+}
+
+
+
 // ------------ method called for each event  ------------
 void gemBackground::analyze(const edm::Event& iEvent, const edm::EventSetup& iSetup) {
   edm::Handle<GEMRecHitCollection> gemRecHits;
   iEvent.getByToken(gemRecHits_, gemRecHits);
 
+  edm::Handle<GEMOHStatusCollection> oh_status_collection;
+  iEvent.getByToken(oh_status_collection_, oh_status_collection);
+
   edm::Handle<OnlineLuminosityRecord> onlineLumiRecord;
   iEvent.getByToken(onlineLumiRecord_, onlineLumiRecord);
-
-  // std::cout << "TIME: " << iEvent.time().unixTime()
-  //     << " EVENTID: " << iEvent.id()
-  //     << " BX: " << iEvent.bunchCrossing()
-  //     << " ORBITNUMBER: " << iEvent.orbitNumber()
-  //     << " INST.LUMI.: " << onlineLumiRecord->instLumi()
-  //     << std::endl;
 
   b_instLumi = onlineLumiRecord->instLumi();
   b_bunchId = iEvent.bunchCrossing();
@@ -128,8 +165,21 @@ void gemBackground::analyze(const edm::Event& iEvent, const edm::EventSetup& iSe
   b_event = iEvent.id().event();
 
   for (auto rechit = gemRecHits->begin(); rechit != gemRecHits->end(); ++rechit) {
-    GEMDetId gem_id = rechit->gemId();
-    if (!gem_id.isGE11()) continue;
+    const GEMDetId gem_id = rechit->gemId();
+    if (!gem_id.isGE11()) {
+      continue;
+    }
+    GEMDetId chamber_id = gem_id.chamberId();
+    if (maskChamberWithError(chamber_id, oh_status_collection)) {
+      //  std::cout << "BAD: " << chamber_id << std::endl;
+      b_region = gem_id.region();
+      b_layer = gem_id.layer();
+      b_chamber = gem_id.chamber();
+      Key2 key2{b_region, b_layer};
+      bad_chamber_[key2]->Fill(b_chamber);
+      continue;
+    }
+
     b_region = gem_id.region();
     b_layer = gem_id.layer();
     b_chamber = gem_id.chamber();
@@ -138,25 +188,24 @@ void gemBackground::analyze(const edm::Event& iEvent, const edm::EventSetup& iSe
     b_cluster_size = rechit->clusterSize();
 
     t_rec_hits->Fill();
-
-    // std::cout << "region: " << b_region
-    //     << " layer: " << b_layer
-    //     << " chamber: " << b_chamber
-    //     << " ieta: " << b_ieta
-    //     << " first_strip: " << b_first_strip
-    //     << " cluster_size: " << b_cluster_size
-    //     << std::endl;
   }
 }
 
 // ------------ method called once each job just before starting event loop  ------------
 void gemBackground::beginJob() {
-  // please remove this method if not needed
+  int st = 1;
+  for (int re = -1; re <= 1; re += 2) {
+    for (int la = 1; la <= 2; ++la) {
+      Key2 key2{re, la};
+      bad_chamber_[key2] = fs_->make<TH1D>(Form("bad_chamber_GE%d/%d-L%d", re, st, la),
+                                           Form("Bad Chambers GE%d/%d-L%d", re, st, la),
+                                           36, 0.5, 36.5);
+    }
+  }
 }
 
 // ------------ method called once each job just after ending the event loop  ------------
 void gemBackground::endJob() {
-  // please remove this method if not needed
 }
 
 // ------------ method fills 'descriptions' with the allowed parameters for the module  ------------
