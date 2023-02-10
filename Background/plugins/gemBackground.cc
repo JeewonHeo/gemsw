@@ -38,9 +38,11 @@
 
 #include "DataFormats/GEMDigi/interface/GEMDigiCollection.h"
 #include "DataFormats/GEMDigi/interface/GEMOHStatusCollection.h"
+#include "DataFormats/GEMDigi/interface/GEMVFATStatusCollection.h"
 #include "DataFormats/GEMRecHit/interface/GEMRecHitCollection.h"
 #include "DataFormats/MuonDetId/interface/GEMDetId.h"
 #include "DataFormats/OnlineMetaData/interface/OnlineLuminosityRecord.h"
+#include "DataFormats/TCDS/interface/TCDSRecord.h"
 
 #include "Geometry/Records/interface/MuonGeometryRecord.h"
 #include "Geometry/GEMGeometry/interface/GEMGeometry.h"
@@ -50,6 +52,7 @@
 
 #include "TFile.h"
 #include "TH1D.h"
+#include "TH2D.h"
 #include "TTree.h"
 
 // class declaration
@@ -61,6 +64,7 @@
 // This will improve performance in multithreaded jobs.
 
 
+constexpr size_t max_trigger = 16;
 typedef std::tuple<int, int> Key2;
 
 class gemBackground : public edm::one::EDAnalyzer<> {
@@ -71,19 +75,24 @@ public:
   static void fillDescriptions(edm::ConfigurationDescriptions& descriptions);
 
 private:
-  bool maskChamberWithError(const GEMDetId& chamber_id, const edm::Handle<GEMOHStatusCollection>);
-  virtual void analyze(const edm::Event&, const edm::EventSetup&);// override;
+  bool maskChamberWithError(const GEMDetId& chamber_id, const edm::Handle<GEMVFATStatusCollection>, const edm::Handle<GEMOHStatusCollection>);
+  virtual void analyze(const edm::Event&, const edm::EventSetup&) override;
   virtual void beginJob() override;
   virtual void endJob() override;
 
   // ----------member data ---------------------------
-  edm::EDGetTokenT<GEMDigiCollection> gemDigis_;
   edm::EDGetTokenT<GEMOHStatusCollection> oh_status_collection_;
+  edm::EDGetTokenT<GEMVFATStatusCollection> vfat_status_collection_;
   edm::EDGetTokenT<GEMRecHitCollection> gemRecHits_;
   edm::EDGetTokenT<OnlineLuminosityRecord> onlineLumiRecord_;
   edm::ESGetToken<GEMGeometry, MuonGeometryRecord> hGEMGeom_;
+  edm::EDGetTokenT<TCDSRecord> tcdsRecord_;
 
-  std::map<Key2, TH1D*> bad_chamber_;
+  TH1D* n_event_;
+  TH2D* bad_chamber_PL1_;
+  TH2D* bad_chamber_PL2_;
+  TH2D* bad_chamber_ML1_;
+  TH2D* bad_chamber_ML2_;
   edm::Service<TFileService> fs_;
 
   TTree *t_rec_hits;
@@ -93,11 +102,14 @@ private:
   int b_first_strip, b_cluster_size;
 };
 
-gemBackground::gemBackground(const edm::ParameterSet& iConfig) {
-  gemDigis_ = consumes<GEMDigiCollection>(iConfig.getParameter<edm::InputTag>("muonGEMDigis"));
+gemBackground::gemBackground(const edm::ParameterSet& iConfig)
+  : hGEMGeom_(esConsumes()) {
   oh_status_collection_ = consumes<GEMOHStatusCollection>(iConfig.getParameter<edm::InputTag>("OHInputLabel"));
+  vfat_status_collection_ = consumes<GEMVFATStatusCollection>(iConfig.getParameter<edm::InputTag>("VFATInputLabel"));
   gemRecHits_ = consumes<GEMRecHitCollection>(iConfig.getParameter<edm::InputTag>("gemRecHits"));
   onlineLumiRecord_ = consumes<OnlineLuminosityRecord>(iConfig.getParameter<edm::InputTag>("onlineMetaDataDigis"));
+  tcdsRecord_ = consumes<TCDSRecord>(iConfig.getParameter<edm::InputTag>("tcdsRecord"));
+
   t_rec_hits = fs_->make<TTree>("rec_hits", "gem_rec_hits");
   #define BRANCH_(name, suffix) t_rec_hits->Branch(#name, & b_##name, #name "/" #suffix);
   BRANCH_(instLumi, F);
@@ -125,7 +137,7 @@ gemBackground::~gemBackground() {
 //
 
 bool gemBackground::maskChamberWithError(const GEMDetId& chamber_id,
-                                         // const GEMOHStatusCollection* oh_status_collection) {
+                                         const edm::Handle<GEMVFATStatusCollection> vfat_status_collection,
                                          const edm::Handle<GEMOHStatusCollection> oh_status_collection) {
   const bool mask = true;
   for (auto iter = oh_status_collection->begin(); iter != oh_status_collection->end(); iter++) {
@@ -142,15 +154,32 @@ bool gemBackground::maskChamberWithError(const GEMDetId& chamber_id,
       }  // isBad
     }  // range
   }  // collection
+  for (auto iter = vfat_status_collection->begin(); iter != vfat_status_collection->end(); iter++) {
+    const auto [vfat_id, range] = (*iter);
+    if (chamber_id != vfat_id.chamberId()) {
+      continue;
+    }
+    for (auto vfat_status = range.first; vfat_status != range.second; vfat_status++) {
+      if (vfat_status->isBad()) {
+        return mask;
+      }  // isBad
+    }  // range
+  }  // collection
   return not mask;
 }
 
 
-
 // ------------ method called for each event  ------------
 void gemBackground::analyze(const edm::Event& iEvent, const edm::EventSetup& iSetup) {
+  edm::ESHandle<GEMGeometry> hGEMGeom;
+  hGEMGeom = iSetup.getHandle(hGEMGeom_);
+  const GEMGeometry* GEMGeometry_ = &*hGEMGeom;
+
   edm::Handle<GEMRecHitCollection> gemRecHits;
   iEvent.getByToken(gemRecHits_, gemRecHits);
+
+  edm::Handle<GEMVFATStatusCollection> vfat_status_collection;
+  iEvent.getByToken(vfat_status_collection_, vfat_status_collection);
 
   edm::Handle<GEMOHStatusCollection> oh_status_collection;
   iEvent.getByToken(oh_status_collection_, oh_status_collection);
@@ -158,50 +187,81 @@ void gemBackground::analyze(const edm::Event& iEvent, const edm::EventSetup& iSe
   edm::Handle<OnlineLuminosityRecord> onlineLumiRecord;
   iEvent.getByToken(onlineLumiRecord_, onlineLumiRecord);
 
+  edm::Handle<TCDSRecord> record;
+  iEvent.getByToken(tcdsRecord_, record);
+
+  if (!record.isValid() || !gemRecHits.isValid()) {
+    std::cout << "Error!" << std::endl;
+    return;
+  }
+  n_event_->Fill(0);
+
+  for (size_t i = 0; i < max_trigger; ++i) {
+    long l1a_diff = 3564 * (record->getOrbitNr() - record->getL1aHistoryEntry(i).getOrbitNr())
+        + record->getBXID() - record->getL1aHistoryEntry(i).getBXID();
+
+    if ((l1a_diff > 150) && (l1a_diff < 250)) {
+      std::cout << "Flower event!!!" << std::endl;
+      return;
+    }
+  }
+  n_event_->Fill(1);
+
   b_instLumi = onlineLumiRecord->instLumi();
   b_bunchId = iEvent.bunchCrossing();
   b_orbitNumber = iEvent.orbitNumber();
   b_eventTime = iEvent.time().unixTime();
   b_event = iEvent.id().event();
 
-  for (auto rechit = gemRecHits->begin(); rechit != gemRecHits->end(); ++rechit) {
-    const GEMDetId gem_id = rechit->gemId();
-    if (!gem_id.isGE11()) {
+  for (auto chamber: GEMGeometry_->chambers()) {
+    GEMDetId chamber_id = chamber->id();
+    if (chamber_id.station() != 1)
+      continue;
+    if (maskChamberWithError(chamber_id, vfat_status_collection, oh_status_collection)) {
+      b_region = chamber_id.region();
+      b_layer = chamber_id.layer();
+      b_chamber = chamber_id.chamber();
+      if (b_region == -1) {
+        if (b_layer == 1) bad_chamber_ML1_->Fill(b_chamber, b_instLumi);
+        if (b_layer == 2) bad_chamber_ML2_->Fill(b_chamber, b_instLumi);
+      } else {
+        if (b_layer == 1) bad_chamber_PL1_->Fill(b_chamber, b_instLumi);
+        if (b_layer == 2) bad_chamber_PL2_->Fill(b_chamber, b_instLumi);
+      }
       continue;
     }
-    GEMDetId chamber_id = gem_id.chamberId();
-    if (maskChamberWithError(chamber_id, oh_status_collection)) {
-      //  std::cout << "BAD: " << chamber_id << std::endl;
-      b_region = gem_id.region();
-      b_layer = gem_id.layer();
-      b_chamber = gem_id.chamber();
-      Key2 key2{b_region, b_layer};
-      bad_chamber_[key2]->Fill(b_chamber);
-      continue;
-    }
-
-    b_region = gem_id.region();
-    b_layer = gem_id.layer();
-    b_chamber = gem_id.chamber();
-    b_ieta = gem_id.ieta();
-    b_first_strip = rechit->firstClusterStrip();
-    b_cluster_size = rechit->clusterSize();
-
-    t_rec_hits->Fill();
-  }
+    for (auto eta_part: chamber->etaPartitions()) {
+      GEMDetId eta_part_id = eta_part->id();
+      b_region = eta_part_id.region();
+      b_layer = eta_part_id.layer();
+      b_chamber = eta_part_id.chamber();
+      b_ieta = eta_part_id.ieta();
+      auto range = gemRecHits->get(eta_part_id);
+      for (auto rechit = range.first; rechit != range.second; ++rechit) {
+        b_first_strip = rechit->firstClusterStrip();
+        b_cluster_size = rechit->clusterSize();
+        t_rec_hits->Fill();
+      }  // hits
+    }  // eta partition
+  }  // chambers
 }
+
 
 // ------------ method called once each job just before starting event loop  ------------
 void gemBackground::beginJob() {
-  int st = 1;
-  for (int re = -1; re <= 1; re += 2) {
-    for (int la = 1; la <= 2; ++la) {
-      Key2 key2{re, la};
-      bad_chamber_[key2] = fs_->make<TH1D>(Form("bad_chamber_GE%d/%d-L%d", re, st, la),
-                                           Form("Bad Chambers GE%d/%d-L%d", re, st, la),
-                                           36, 0.5, 36.5);
-    }
-  }
+  n_event_ = fs_->make<TH1D>("events", "Events", 2, -0.5, 1.5);
+  bad_chamber_PL1_ = fs_->make<TH2D>("bad_chamber_PL1", "bad chamber GE1/1-L1",
+                                     36, 0.5, 36.5,
+                                     30, 0, 30000);
+  bad_chamber_PL2_ = fs_->make<TH2D>("bad_chamber_PL2", "bad chamber GE1/1-L2",
+                                     36, 0.5, 36.5,
+                                     30, 0, 30000);
+  bad_chamber_ML1_ = fs_->make<TH2D>("bad_chamber_ML1", "bad chamber GE-1/1-L1",
+                                     36, 0.5, 36.5,
+                                     30, 0, 30000);
+  bad_chamber_ML2_ = fs_->make<TH2D>("bad_chamber_ML2", "bad chamber GE-1/1-L2",
+                                     36, 0.5, 36.5,
+                                     30, 0, 30000);
 }
 
 // ------------ method called once each job just after ending the event loop  ------------
