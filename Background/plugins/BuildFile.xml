@@ -4,6 +4,7 @@
 <use name="DataFormats/GEMDigi"/>
 <use name="DataFormats/MuonDetId"/>
 <use name="DataFormats/OnlineMetaData"/>
+<use name="DataFormats/TCDS"/>
 
 <use name="FWCore/Framework"/>
 <use name="FWCore/ParameterSet"/>
