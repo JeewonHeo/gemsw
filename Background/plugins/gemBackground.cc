@@ -89,17 +89,19 @@ private:
   edm::EDGetTokenT<TCDSRecord> tcdsRecord_;
 
   TH1D* n_event_;
-  TH2D* bad_chamber_PL1_;
-  TH2D* bad_chamber_PL2_;
-  TH2D* bad_chamber_ML1_;
-  TH2D* bad_chamber_ML2_;
+  // TH2D* bad_chamber_PL1_;
+  // TH2D* bad_chamber_PL2_;
+  // TH2D* bad_chamber_ML1_;
+  // TH2D* bad_chamber_ML2_;
   edm::Service<TFileService> fs_;
 
   TTree *t_rec_hits;
   float b_instLumi;
-  int b_event, b_eventTime, b_bunchId, b_orbitNumber;
-  int b_region, b_layer, b_chamber, b_ieta;
+  long b_event, b_eventTime;
+  int b_bunchId, b_orbitNumber;
+  int b_region, b_layer, b_chamber, b_ieta, b_chamber_error;
   int b_first_strip, b_cluster_size;
+  int b_big_cluster_event;
 };
 
 gemBackground::gemBackground(const edm::ParameterSet& iConfig)
@@ -113,8 +115,8 @@ gemBackground::gemBackground(const edm::ParameterSet& iConfig)
   t_rec_hits = fs_->make<TTree>("rec_hits", "gem_rec_hits");
   #define BRANCH_(name, suffix) t_rec_hits->Branch(#name, & b_##name, #name "/" #suffix);
   BRANCH_(instLumi, F);
-  BRANCH_(event, I);
-  BRANCH_(eventTime, I);
+  BRANCH_(event, l);
+  BRANCH_(eventTime, l);
   BRANCH_(bunchId, I);
   BRANCH_(orbitNumber, I);
   BRANCH_(region, I);
@@ -123,6 +125,8 @@ gemBackground::gemBackground(const edm::ParameterSet& iConfig)
   BRANCH_(ieta, I);
   BRANCH_(first_strip, I);
   BRANCH_(cluster_size, I);
+  BRANCH_(chamber_error, I);
+  BRANCH_(big_cluster_event, I);
 }
 
 gemBackground::~gemBackground() {
@@ -149,7 +153,6 @@ bool gemBackground::maskChamberWithError(const GEMDetId& chamber_id,
     for (auto oh_status = range.first; oh_status != range.second; oh_status++) {
       if (oh_status->isBad()) {
         // GEMOHStatus is bad. Mask this chamber.
-        // std::cout << "Chamber Id " << oh_id << " isBad " << oh_status->isBad() << std::endl;
         return mask;
       }  // isBad
     }  // range
@@ -196,15 +199,57 @@ void gemBackground::analyze(const edm::Event& iEvent, const edm::EventSetup& iSe
   }
   n_event_->Fill(0);
 
+  // float n_clusters = 0;
+  // float n_hits = 0;
+  // std::vector<std::vector<int>> n_hits_each_chamber(8, std::vector<int>(36, 0)); // giving max nDigis in one chamber
+  std::vector<std::vector<int>> n_hits_each_etaPart(8, std::vector<int>(576, 0)); // giving max nDigis in one etaPartition
+
+  for (const GEMRecHit& cluster : *gemRecHits) {
+    // ++n_clusters;
+    GEMDetId hit_id = cluster.gemId();
+    int layer_index = (hit_id.region()+1)/2 + 2*(hit_id.station()-1) + 4*(hit_id.layer()-1);
+    // n_hits = cluster.clusterSize();
+    // n_hits_each_chamber[layer_index][hit_id.chamber() - 1] += n_hits;
+    int eta_index = 16 * (hit_id.chamber() - 1) + hit_id.ieta() - 1;
+    n_hits_each_etaPart[layer_index][eta_index] += cluster.clusterSize();
+  }
+
+  /*  we don't want to use hit based cut
+  if ((n_clusters > 650.) || ((n_clusters - 50.) * (2000. / 600.) > n_hits)) {
+    return;
+   }
+  */
+
+  /* W.Heo's flower event cut
+  int max_val = *std::max_element(n_hits_each_chamber[0].begin(),n_hits_each_chamber[0].end());
+  for (const auto& row : n_hits_each_chamber) {
+    max_val = std::max(max_val, *std::max_element(row.begin(), row.end()));
+    if (max_val > 384) return;
+  }
+  */
+  b_big_cluster_event = 0;
+  int max_val;
+  // for (const auto& row : n_hits_each_chamber) {
+  for (const auto& row : n_hits_each_etaPart) {
+    max_val = *std::max_element(row.begin(), row.end());
+    // if (max_val > 384) return; // big cluster event filter
+    if (max_val > 48) {
+      b_big_cluster_event = 1; // big cluster event filter
+    }
+  }
+
+
+  /*  Laurant's method */
   for (size_t i = 0; i < max_trigger; ++i) {
     long l1a_diff = 3564 * (record->getOrbitNr() - record->getL1aHistoryEntry(i).getOrbitNr())
         + record->getBXID() - record->getL1aHistoryEntry(i).getBXID();
 
-    if ((l1a_diff > 150) && (l1a_diff < 250)) {
+    if ((l1a_diff > 150) && (l1a_diff < 200)) {
       std::cout << "Flower event!!!" << std::endl;
       return;
     }
   }
+  /**/
   n_event_->Fill(1);
 
   b_instLumi = onlineLumiRecord->instLumi();
@@ -217,6 +262,7 @@ void gemBackground::analyze(const edm::Event& iEvent, const edm::EventSetup& iSe
     GEMDetId chamber_id = chamber->id();
     if (chamber_id.station() != 1)
       continue;
+    /* disabled to keep bad chambers with flag
     if (maskChamberWithError(chamber_id, vfat_status_collection, oh_status_collection)) {
       b_region = chamber_id.region();
       b_layer = chamber_id.layer();
@@ -230,6 +276,8 @@ void gemBackground::analyze(const edm::Event& iEvent, const edm::EventSetup& iSe
       }
       continue;
     }
+    */
+    b_chamber_error = maskChamberWithError(chamber_id, vfat_status_collection, oh_status_collection);
     for (auto eta_part: chamber->etaPartitions()) {
       GEMDetId eta_part_id = eta_part->id();
       b_region = eta_part_id.region();
@@ -250,18 +298,18 @@ void gemBackground::analyze(const edm::Event& iEvent, const edm::EventSetup& iSe
 // ------------ method called once each job just before starting event loop  ------------
 void gemBackground::beginJob() {
   n_event_ = fs_->make<TH1D>("events", "Events", 2, -0.5, 1.5);
-  bad_chamber_PL1_ = fs_->make<TH2D>("bad_chamber_PL1", "bad chamber GE1/1-L1",
-                                     36, 0.5, 36.5,
-                                     30, 0, 30000);
-  bad_chamber_PL2_ = fs_->make<TH2D>("bad_chamber_PL2", "bad chamber GE1/1-L2",
-                                     36, 0.5, 36.5,
-                                     30, 0, 30000);
-  bad_chamber_ML1_ = fs_->make<TH2D>("bad_chamber_ML1", "bad chamber GE-1/1-L1",
-                                     36, 0.5, 36.5,
-                                     30, 0, 30000);
-  bad_chamber_ML2_ = fs_->make<TH2D>("bad_chamber_ML2", "bad chamber GE-1/1-L2",
-                                     36, 0.5, 36.5,
-                                     30, 0, 30000);
+  // bad_chamber_PL1_ = fs_->make<TH2D>("bad_chamber_PL1", "bad chamber GE1/1-L1",
+  //                                    36, 0.5, 36.5,
+  //                                    30, 0, 30000);
+  // bad_chamber_PL2_ = fs_->make<TH2D>("bad_chamber_PL2", "bad chamber GE1/1-L2",
+  //                                    36, 0.5, 36.5,
+  //                                    30, 0, 30000);
+  // bad_chamber_ML1_ = fs_->make<TH2D>("bad_chamber_ML1", "bad chamber GE-1/1-L1",
+  //                                    36, 0.5, 36.5,
+  //                                    30, 0, 30000);
+  // bad_chamber_ML2_ = fs_->make<TH2D>("bad_chamber_ML2", "bad chamber GE-1/1-L2",
+  //                                    36, 0.5, 36.5,
+  //                                    30, 0, 30000);
 }
 
 // ------------ method called once each job just after ending the event loop  ------------
